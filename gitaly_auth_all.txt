@@ -1,0 +1,323 @@
+===== FILE: extract_test.go =====
+package gitalyauth
+
+import (
+	"testing"
+	"time"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/metadata"
+	"github.com/stretchr/testify/require"
+	"gitlab.com/gitlab-org/gitaly/v16/internal/testhelper"
+)
+
+func TestCheckTokenV2(t *testing.T) {
+	// the tests below had their hmac signatures generated with the default 30s
+	// in our tests, we modify this number with ldflags but this test should continue
+	// to use the 30s number
+
+	defer func(d time.Duration) {
+		tokenValidityDuration = d
+	}(tokenValidityDuration)
+
+	tokenValidityDuration = 30 * time.Second
+
+	targetTime := time.Unix(1535671600, 0)
+	secret := []byte("foo")
+
+	testCases := []struct {
+		desc   string
+		token  string
+		result error
+	}{
+		{
+			desc:   "Valid v2 secret, future time within threshold",
+			token:  "v2.3346cb25ecdb928defd368e7390522a86764bbdf1e8b21aaef27c4c23ec9c899.1535671615",
+			result: nil,
+		},
+		{
+			desc:   "Valid v2 secret, past time within threshold",
+			token:  "v2.b77158328e80be2984eaf08788419d25f3484eae484aec1297af6bdf1a456610.1535671585",
+			result: nil,
+		},
+		{
+			desc:   "Invalid secret, time within threshold",
+			token:  "v2.52a3b9016f46853c225c72b87617ac27109bba8a3068002069ab90e28253a911.1535671585",
+			result: newPermissionDeniedError("wrong hmac signature"),
+		},
+		{
+			desc:   "Valid secret, time too much in the future",
+			token:  "v2.ab9e7315aeecf6815fc0df585370157814131acab376f41797ad4ebc4d9a823c.1535671631",
+			result: newPermissionDeniedError("token's validity window is in future"),
+		},
+		{
+			desc:   "Valid secret, time too much in the past",
+			token:  "v2.f805bc69ca3aedd99e814b3fb1fc1e6a1094191691480b168a20fad7c2d24557.1535671569",
+			result: newPermissionDeniedError("token has expired"),
+		},
+		{
+			desc:   "Mismatching signed and clear message",
+			token:  "v2.319b96a3194c1cb2a2e6f1386161aca1c4cda13257fa9df8a328ab6769649bb0.1535671599",
+			result: newPermissionDeniedError("wrong hmac signature"),
+		},
+		{
+			desc:   "Invalid version",
+			token:  "v3.6fec98e8fe494284ce545c4b421799f02b9718b0eadfc3772d027e1ac5d6d569.1535671601",
+			result: newPermissionDeniedError("invalid token version"),
+		},
+		{
+			desc:   "Invalid token format",
+			token:  "foo.bar",
+			result: errUnauthenticated,
+		},
+		{
+			desc:   "Empty token",
+			token:  "",
+			result: errUnauthenticated,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := testhelper.Context(t)
+
+			md := metadata.MD{}
+			md.Set("authorization", "Bearer "+tc.token)
+			result := CheckToken(md.ToIncoming(ctx), string(secret), targetTime)
+
+			require.Equal(t, tc.result, result)
+		})
+	}
+}
+
+
+===== FILE: README.md =====
+# Gitaly authentication middleware for Go
+
+This package contains code that plugs into
+`github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth` to provide client
+and server authentication middleware for Gitaly.
+
+Gitaly has two authentication schemes.
+
+## V1 authentication (deprecated)
+
+This scheme uses a shared secret. The shared secret is base64-encoded
+and passed by the client as a bearer token.
+
+## V2 authentication
+
+This scheme uses a time limited token derived from a shared secret.
+
+The client creates a timestamp and computes the SHA256 HMAC signature
+for that timestamp, treating the timestamp as the message. The shared
+secret is used as the key for the HMAC. The client then sends both the
+message and the signature to the server as a bearer token.
+
+The server takes the message and computes the signature. If the
+client-provided signature matches the computed signature the message is
+accepted. Next, the server checks if its current time is no more than
+30 seconds ahead or behind the timestamp. If the timestamp is too old
+or too new the request is denied. Otherwise it goes ahead.
+
+
+===== FILE: rpccredentials.go =====
+package gitalyauth
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"time"
+
+	"google.golang.org/grpc/credentials"
+)
+
+// RPCCredentialsV2 can be used with grpc.WithPerRPCCredentials to create
+// a grpc.DialOption that inserts an V2 (HMAC) token with the current
+// timestamp for authentication with a Gitaly server. The shared secret
+// must match the one used on the Gitaly server.
+func RPCCredentialsV2(sharedSecret string) credentials.PerRPCCredentials {
+	return &rpcCredentialsV2{sharedSecret: sharedSecret}
+}
+
+type rpcCredentialsV2 struct {
+	sharedSecret string
+}
+
+func (*rpcCredentialsV2) RequireTransportSecurity() bool { return false }
+
+func (rc2 *rpcCredentialsV2) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	message := strconv.FormatInt(time.Now().Unix(), 10)
+	signature := hmacSign([]byte(rc2.sharedSecret), message)
+
+	return map[string]string{
+		"authorization": "Bearer " + fmt.Sprintf("v2.%x.%s", signature, message),
+	}, nil
+}
+
+
+===== FILE: testhelper_test.go =====
+package gitalyauth
+
+import (
+	"testing"
+
+	"gitlab.com/gitlab-org/gitaly/v16/internal/testhelper"
+)
+
+func TestMain(m *testing.M) {
+	testhelper.Run(m)
+}
+
+
+===== FILE: token.go =====
+package gitalyauth
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	grpcmwauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+var (
+	//nolint:gochecknoglobals
+	// This infrastructure is required for testing purposes and there is no
+	// proper place to put it instead. While we could move it into the
+	// config, we certainly don't want to make it configurable for now, so
+	// it'd be a bad fit there.
+	tokenValidityDuration = 30 * time.Second
+
+	errUnauthenticated = status.Errorf(codes.Unauthenticated, "authentication required")
+
+	authErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gitaly_authentication_errors_total",
+			Help: "Counts of Gitaly request authentication errors",
+		},
+		[]string{"version", "error"},
+	)
+)
+
+const tokenVersionV2 = "v2"
+
+func newPermissionDeniedError(reason string) error {
+	return status.Errorf(codes.PermissionDenied, "permission denied: %s", reason)
+}
+
+// TokenValidityDuration returns the duration for which any token will be
+// valid. This is currently only used by our testing infrastructure.
+func TokenValidityDuration() time.Duration {
+	return tokenValidityDuration
+}
+
+// SetTokenValidityDuration changes the duration for which any token will be
+// valid. It only applies to newly created tokens.
+func SetTokenValidityDuration(d time.Duration) {
+	tokenValidityDuration = d
+}
+
+// AuthInfo contains the authentication information coming from a request
+type AuthInfo struct {
+	Version       string
+	SignedMessage []byte
+	Message       string
+}
+
+// CheckToken checks the 'authentication' header of incoming gRPC
+// metadata in ctx. It returns nil if and only if the token matches
+// secret.
+func CheckToken(ctx context.Context, secret string, targetTime time.Time) error {
+	if len(secret) == 0 {
+		return status.Errorf(codes.Unauthenticated, "secret must not be empty")
+	}
+
+	authInfo, err := ExtractAuthInfo(ctx)
+	if err != nil {
+		return errUnauthenticated
+	}
+
+	if authInfo.Version != tokenVersionV2 {
+		return newPermissionDeniedError("invalid token version")
+	}
+
+	return v2HmacInfoValid(authInfo.Message, authInfo.SignedMessage, []byte(secret), targetTime, tokenValidityDuration)
+}
+
+// ExtractAuthInfo returns an `AuthInfo` with the data extracted from `ctx`
+func ExtractAuthInfo(ctx context.Context) (*AuthInfo, error) {
+	token, err := grpcmwauth.AuthFromMD(ctx, "bearer")
+	if err != nil {
+		return nil, err
+	}
+
+	split := strings.SplitN(token, ".", 3)
+
+	if len(split) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+
+	version, sig, msg := split[0], split[1], split[2]
+	decodedSig, err := hex.DecodeString(sig)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AuthInfo{Version: version, SignedMessage: decodedSig, Message: msg}, nil
+}
+
+func countV2Error(message string) { authErrors.WithLabelValues(tokenVersionV2, message).Inc() }
+
+func v2HmacInfoValid(message string, signedMessage, secret []byte, targetTime time.Time, tokenValidity time.Duration) error {
+	expectedHMAC := hmacSign(secret, message)
+	if !hmac.Equal(signedMessage, expectedHMAC) {
+		const reason = "wrong hmac signature"
+		countV2Error(reason)
+		return newPermissionDeniedError(reason)
+	}
+
+	timestamp, err := strconv.ParseInt(message, 10, 64)
+	if err != nil {
+		const reason = "cannot parse timestamp"
+		countV2Error(reason)
+		return newPermissionDeniedError(fmt.Sprintf("%s: %s", reason, err))
+	}
+
+	issuedAt := time.Unix(timestamp, 0)
+	lowerBound := targetTime.Add(-tokenValidity)
+	upperBound := targetTime.Add(tokenValidity)
+
+	if issuedAt.Before(lowerBound) {
+		const reason = "token has expired"
+		countV2Error(reason)
+		return newPermissionDeniedError(reason)
+	}
+
+	if issuedAt.After(upperBound) {
+		const reason = "token's validity window is in future"
+		countV2Error(reason)
+		return newPermissionDeniedError(reason)
+	}
+
+	return nil
+}
+
+func hmacSign(secret []byte, message string) []byte {
+	mac := hmac.New(sha256.New, secret)
+	// hash.Hash never returns an error.
+	_, _ = mac.Write([]byte(message))
+
+	return mac.Sum(nil)
+}
+
+
