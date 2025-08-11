@@ -18,6 +18,30 @@ const iface = new ethers.utils.Interface([
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 ]);
 
+async function scanTransfersInRange(fromBlock, toBlock) {
+  const TRANSFER_TOPIC = ethers.utils.id("Transfer(address,address,uint256)");
+  const logs = await provider.getLogs({
+    address: PROXY,
+    fromBlock,
+    toBlock,
+    topics: [TRANSFER_TOPIC]
+  });
+  const incoming = [];
+  const outgoing = [];
+  for (const l of logs) {
+    let parsed;
+    try { parsed = iface.parseLog(l); } catch (_) { continue; }
+    const from = parsed.args.from.toLowerCase();
+    const to = parsed.args.to.toLowerCase();
+    const value = parsed.args.value;
+    if (to === PROXY) incoming.push({ blockNumber: l.blockNumber, txHash: l.transactionHash, from, to, value });
+    if (from === PROXY) outgoing.push({ blockNumber: l.blockNumber, txHash: l.transactionHash, from, to, value });
+  }
+  const sumIn = incoming.reduce((acc, x) => acc.add(x.value), ethers.BigNumber.from(0));
+  const sumOut = outgoing.reduce((acc, x) => acc.add(x.value), ethers.BigNumber.from(0));
+  return { incoming, outgoing, sumIn, sumOut };
+}
+
 (async () => {
   console.log("RPC:", RPC);
 
@@ -46,6 +70,7 @@ const iface = new ethers.utils.Interface([
       // Fetch receipt and decode logs
       try {
         const rcpt = await provider.getTransactionReceipt(tx.hash);
+        console.log("receipt (raw):", JSON.stringify(rcpt));
         console.log("receipt status:", rcpt.status, "logs:", rcpt.logs.length);
         for (const l of rcpt.logs) {
           let parsed;
@@ -62,6 +87,13 @@ const iface = new ethers.utils.Interface([
         }
       } catch (e) {
         console.log("receipt fetch error:", e.message || e);
+      }
+      // Attempt trace_transaction if supported
+      try {
+        const trace = await provider.send("trace_transaction", [tx.hash]);
+        console.log("trace_transaction length:", Array.isArray(trace) ? trace.length : typeof trace);
+      } catch (e) {
+        console.log("trace_transaction not available:", e.message || e);
       }
     }
   }
@@ -126,7 +158,12 @@ const iface = new ethers.utils.Interface([
   }
   console.log("wider window total logs:", total);
 
-  // 4) Check implementation bytecode contains selector
+  // 4) Transfer reconstruction before toggle: [FIRST_CODE_BLOCK, TOGGLE_BLOCK]
+  const { incoming, outgoing, sumIn, sumOut } = await scanTransfersInRange(FIRST_CODE_BLOCK, TOGGLE_BLOCK);
+  console.log(`Transfers to proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, incoming.length, "sumIn:", sumIn.toString());
+  console.log(`Transfers from proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, outgoing.length, "sumOut:", sumOut.toString());
+
+  // 5) Check implementation bytecode contains selector
   const code = await provider.getCode(IMPLEMENTATION, "latest");
   const hasSelector = code.toLowerCase().includes(INIT_V21_SELECTOR.slice(2));
   console.log("implementation selector 0x2fc81e09 present:", hasSelector);
