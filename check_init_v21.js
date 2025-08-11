@@ -126,6 +126,27 @@ async function findBlacklistToggleBlock(contract, startBlock, endBlock) {
   return ans;
 }
 
+async function scanTransfersWindow(fromBlock, toBlock, chunk) {
+  console.log(`Scanning Transfer-from-proxy events in [${fromBlock}, ${toBlock}] with chunk ${chunk}...`);
+  let total = 0;
+  for (let start = fromBlock; start <= toBlock; start += chunk) {
+    const end = Math.min(toBlock, start + chunk - 1);
+    try {
+      const logs = await fetchTransferFromProxy(start, end);
+      if (logs.length > 0) {
+        total += logs.length;
+        for (const t of logs) {
+          const to = "0x" + t.topics[2].slice(26);
+          console.log("  Transfer from proxy ->", to, "block:", t.blockNumber, "tx:", t.transactionHash, "value:", t.data);
+        }
+      }
+    } catch (e) {
+      console.log(`  Transfer scan error on [${start}, ${end}]:`, e.message || e);
+    }
+  }
+  console.log(`Total Transfer-from-proxy events in window: ${total}`);
+}
+
 (async () => {
   console.log("Using RPC:", RPC);
   console.log("Proxy:", PROXY);
@@ -153,13 +174,14 @@ async function findBlacklistToggleBlock(contract, startBlock, endBlock) {
   const latest = await provider.getBlockNumber();
 
   // 3) Try to locate the block when proxy became blacklisted (if currently true)
+  let firstCodeBlock = await findFirstCodeBlock(PROXY, latest);
+  console.log("First block with code at proxy:", firstCodeBlock);
+
   if (isBlacklistedSelf) {
     console.log("Attempting to locate the first block where proxy became blacklisted (binary search)...");
-    const firstCodeBlock = await findFirstCodeBlock(PROXY, latest);
     if (firstCodeBlock === -1) {
       console.log("Could not determine firstCodeBlock; skipping toggle search.");
     } else {
-      // quick check: ensure at firstCodeBlock it's false; if already true, we cannot find toggle
       const atStart = await callAtBlock(contract, "isBlacklisted", [PROXY], firstCodeBlock);
       if (atStart === undefined) {
         console.log("Provider does not support historical state reads adequately; skipping toggle search.");
@@ -202,36 +224,10 @@ async function findBlacklistToggleBlock(contract, startBlock, endBlock) {
     }
   }
 
-  // 4) Optionally scan for any Transfer from proxy in the whole window regardless of blacklist status
-  const scanWindow = parseInt(process.env.SCAN_WINDOW || "0", 10);
-  if (scanWindow > 0 && (!isBlacklistedSelf || ALWAYS_SCAN_TRANSFERS)) {
-    const fromBlock = Math.max(0, latest - scanWindow);
-    const toBlock = latest;
-    console.log("Scanning for any Transfer-from-proxy events in the window...");
-    const CHUNK = parseInt(process.env.CHUNK || "100000", 10);
-    try {
-      const transfers = [];
-      for (let start = fromBlock; start <= toBlock; start += CHUNK) {
-        const end = Math.min(toBlock, start + CHUNK - 1);
-        try {
-          const logs = await fetchTransferFromProxy(start, end);
-          for (const l of logs) transfers.push(l);
-        } catch (e) {
-          console.log(`  Transfer scan error on [${start}, ${end}]:`, e.message || e);
-        }
-      }
-      if (transfers.length === 0) {
-        console.log("No Transfer-from-proxy events detected in scanned window.");
-      } else {
-        console.log(`Found ${transfers.length} Transfer-from-proxy events in scanned window:`);
-        for (const t of transfers) {
-          const to = "0x" + t.topics[2].slice(26);
-          console.log("  Transfer from proxy ->", to, "block:", t.blockNumber, "tx:", t.transactionHash);
-        }
-      }
-    } catch (e) {
-      console.log("Transfer full-window scan error:", e.message || e);
-    }
+  // 4) Full-window transfer scan from firstCodeBlock to latest in safe chunks (default 50000)
+  const CHUNK = parseInt(process.env.CHUNK || "50000", 10);
+  if (firstCodeBlock > 0) {
+    await scanTransfersWindow(firstCodeBlock, latest, CHUNK);
   }
 
   console.log("Done.");
