@@ -14,8 +14,23 @@ const LOG_TO = 0x1217554;   // 18969940
 
 const iface = new ethers.utils.Interface([
   "function initializeV2_1(address lostAndFound)",
+  "function isBlacklisted(address) view returns (bool)",
+  "function owner() view returns (address)",
+  "function pauser() view returns (address)",
+  "function blacklister() view returns (address)",
+  "function masterMinter() view returns (address)",
+  "function rescuer() view returns (address)",
+  "function oracle() view returns (address)",
+  "function paused() view returns (bool)",
+  "function DOMAIN_SEPARATOR() view returns (bytes32)",
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
   "event Blacklisted(address indexed account)",
-  "event Transfer(address indexed from, address indexed to, uint256 value)"
+  "event UnBlacklisted(address indexed account)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+  "event Upgraded(address indexed implementation)"
 ]);
 
 async function scanTransfersInRange(fromBlock, toBlock) {
@@ -44,6 +59,26 @@ async function scanTransfersInRange(fromBlock, toBlock) {
 
 (async () => {
   console.log("RPC:", RPC);
+
+  // Quick live introspection
+  try {
+    const c = new ethers.Contract(PROXY, iface, provider);
+    const [o, p, b, m, r, orc, ps, dom, nm, sym, dec, ts] = await Promise.all([
+      c.owner().catch(() => undefined),
+      c.pauser().catch(() => undefined),
+      c.blacklister().catch(() => undefined),
+      c.masterMinter().catch(() => undefined),
+      c.rescuer().catch(() => undefined),
+      c.oracle().catch(() => undefined),
+      c.paused().catch(() => undefined),
+      c.DOMAIN_SEPARATOR().catch(() => undefined),
+      c.name().catch(() => undefined),
+      c.symbol().catch(() => undefined),
+      c.decimals().catch(() => undefined),
+      c.totalSupply().catch(() => undefined),
+    ]);
+    console.log("live:", { owner: o, pauser: p, blacklister: b, masterMinter: m, rescuer: r, oracle: orc, paused: ps, DOMAIN_SEPARATOR: dom, name: nm, symbol: sym, decimals: dec, totalSupply: ts ? ts.toString() : undefined });
+  } catch (_) {}
 
   // 1) Block TOGGLE_BLOCK with transactions -> any tx to proxy?
   const blkToggle = await provider.getBlockWithTransactions(TOGGLE_BLOCK);
@@ -138,12 +173,14 @@ async function scanTransfersInRange(fromBlock, toBlock) {
   const toW = TOGGLE_BLOCK + delta;
   const chunk = 500;
   let total = 0;
+  const rawWiderLogs = [];
   console.log(`Scanning wider logs window [${fromW}, ${toW}] in chunks of ${chunk}...`);
   for (let b = fromW; b <= toW; b += chunk) {
     const t = Math.min(toW, b + chunk - 1);
     try {
       const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t });
       total += ls.length;
+      rawWiderLogs.push(...ls);
       // print any logs parsed as Blacklisted/Transfer
       for (const l of ls) {
         let parsed;
@@ -157,13 +194,57 @@ async function scanTransfersInRange(fromBlock, toBlock) {
     }
   }
   console.log("wider window total logs:", total);
+  if (rawWiderLogs.length > 0) {
+    console.log("First couple of raw logs:", rawWiderLogs.slice(0, 2));
+  }
 
   // 4) Transfer reconstruction before toggle: [FIRST_CODE_BLOCK, TOGGLE_BLOCK]
   const { incoming, outgoing, sumIn, sumOut } = await scanTransfersInRange(FIRST_CODE_BLOCK, TOGGLE_BLOCK);
   console.log(`Transfers to proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, incoming.length, "sumIn:", sumIn.toString());
   console.log(`Transfers from proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, outgoing.length, "sumOut:", sumOut.toString());
 
-  // 5) Check implementation bytecode contains selector
+  // 5) Upgraded events across full history since firstCodeBlock
+  const latest = await provider.getBlockNumber();
+  const UPGR_TOPIC = ethers.utils.id("Upgraded(address)");
+  let upgrades = [];
+  console.log(`Scanning Upgraded events from ${FIRST_CODE_BLOCK} to ${latest} in 50000-block chunks...`);
+  for (let b = FIRST_CODE_BLOCK; b <= latest; b += 50000) {
+    const t = Math.min(latest, b + 50000 - 1);
+    try {
+      const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t, topics: [UPGR_TOPIC] });
+      upgrades.push(...ls);
+    } catch (e) {
+      console.log(`  Upgraded scan error [${b}, ${t}]:`, e.message || e);
+    }
+  }
+  console.log("Upgraded events count:", upgrades.length);
+  if (upgrades.length > 0) {
+    for (const l of upgrades) {
+      console.log({ blk: l.blockNumber, tx: l.transactionHash, topic0: l.topics[0], data: l.data, topics: l.topics });
+    }
+  }
+
+  // 6) Full-range Blacklisted events since first code block
+  const BLACKLISTED_TOPIC = ethers.utils.id("Blacklisted(address)");
+  let blCount = 0;
+  let blSamples = [];
+  console.log(`Scanning Blacklisted events from ${FIRST_CODE_BLOCK} to ${latest} in 50000-block chunks...`);
+  for (let b = FIRST_CODE_BLOCK; b <= latest; b += 50000) {
+    const t = Math.min(latest, b + 50000 - 1);
+    try {
+      const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t, topics: [BLACKLISTED_TOPIC] });
+      blCount += ls.length;
+      if (blSamples.length < 5) blSamples.push(...ls.slice(0, 5 - blSamples.length));
+    } catch (e) {
+      console.log(`  Blacklisted scan error [${b}, ${t}]:`, e.message || e);
+    }
+  }
+  console.log("Blacklisted events count:", blCount);
+  if (blSamples.length > 0) {
+    console.log("Blacklisted sample logs:", blSamples.map(l => ({ blk: l.blockNumber, tx: l.transactionHash, topics: l.topics })));
+  }
+
+  // 7) Check implementation bytecode contains selector
   const code = await provider.getCode(IMPLEMENTATION, "latest");
   const hasSelector = code.toLowerCase().includes(INIT_V21_SELECTOR.slice(2));
   console.log("implementation selector 0x2fc81e09 present:", hasSelector);
