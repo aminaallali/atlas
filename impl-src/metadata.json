@@ -1,0 +1,1 @@
+{"message":"request/params/matchType must match format \"match-type\"","errors":[{"path":"/params/matchType","message":"must match format \"match-type\"","errorCode":"format.openapi.validation"}]}

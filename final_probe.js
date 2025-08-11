@@ -1,0 +1,256 @@
+const { ethers } = require("ethers");
+
+const RPC = process.env.RPC_URL || "https://ethereum-rpc.publicnode.com";
+const provider = new ethers.providers.JsonRpcProvider(RPC);
+
+const PROXY = "0xfe18ae03741a5b84e39c295ac9c856ed7991c38e".toLowerCase();
+const IMPLEMENTATION = "0x7e772ed6e4bfeae80f2d58e4254f6b6e96669253";
+const INIT_V21_SELECTOR = "0x2fc81e09";
+
+const TOGGLE_BLOCK = 18969934; // 0x121754e
+const FIRST_CODE_BLOCK = 18969842; // 0x12174f2
+const LOG_FROM = 0x12174f0; // 18969840
+const LOG_TO = 0x1217554;   // 18969940
+
+const iface = new ethers.utils.Interface([
+  "function initializeV2_1(address lostAndFound)",
+  "function isBlacklisted(address) view returns (bool)",
+  "function owner() view returns (address)",
+  "function pauser() view returns (address)",
+  "function blacklister() view returns (address)",
+  "function masterMinter() view returns (address)",
+  "function rescuer() view returns (address)",
+  "function oracle() view returns (address)",
+  "function paused() view returns (bool)",
+  "function DOMAIN_SEPARATOR() view returns (bytes32)",
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
+  "event Blacklisted(address indexed account)",
+  "event UnBlacklisted(address indexed account)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+  "event Upgraded(address indexed implementation)"
+]);
+
+async function scanTransfersInRange(fromBlock, toBlock) {
+  const TRANSFER_TOPIC = ethers.utils.id("Transfer(address,address,uint256)");
+  const logs = await provider.getLogs({
+    address: PROXY,
+    fromBlock,
+    toBlock,
+    topics: [TRANSFER_TOPIC]
+  });
+  const incoming = [];
+  const outgoing = [];
+  for (const l of logs) {
+    let parsed;
+    try { parsed = iface.parseLog(l); } catch (_) { continue; }
+    const from = parsed.args.from.toLowerCase();
+    const to = parsed.args.to.toLowerCase();
+    const value = parsed.args.value;
+    if (to === PROXY) incoming.push({ blockNumber: l.blockNumber, txHash: l.transactionHash, from, to, value });
+    if (from === PROXY) outgoing.push({ blockNumber: l.blockNumber, txHash: l.transactionHash, from, to, value });
+  }
+  const sumIn = incoming.reduce((acc, x) => acc.add(x.value), ethers.BigNumber.from(0));
+  const sumOut = outgoing.reduce((acc, x) => acc.add(x.value), ethers.BigNumber.from(0));
+  return { incoming, outgoing, sumIn, sumOut };
+}
+
+(async () => {
+  console.log("RPC:", RPC);
+
+  // Quick live introspection
+  try {
+    const c = new ethers.Contract(PROXY, iface, provider);
+    const [o, p, b, m, r, orc, ps, dom, nm, sym, dec, ts] = await Promise.all([
+      c.owner().catch(() => undefined),
+      c.pauser().catch(() => undefined),
+      c.blacklister().catch(() => undefined),
+      c.masterMinter().catch(() => undefined),
+      c.rescuer().catch(() => undefined),
+      c.oracle().catch(() => undefined),
+      c.paused().catch(() => undefined),
+      c.DOMAIN_SEPARATOR().catch(() => undefined),
+      c.name().catch(() => undefined),
+      c.symbol().catch(() => undefined),
+      c.decimals().catch(() => undefined),
+      c.totalSupply().catch(() => undefined),
+    ]);
+    console.log("live:", { owner: o, pauser: p, blacklister: b, masterMinter: m, rescuer: r, oracle: orc, paused: ps, DOMAIN_SEPARATOR: dom, name: nm, symbol: sym, decimals: dec, totalSupply: ts ? ts.toString() : undefined });
+  } catch (_) {}
+
+  // 1) Block TOGGLE_BLOCK with transactions -> any tx to proxy?
+  const blkToggle = await provider.getBlockWithTransactions(TOGGLE_BLOCK);
+  const txsToProxyToggle = blkToggle.transactions.filter(
+    (tx) => tx.to && tx.to.toLowerCase() === PROXY
+  );
+  console.log(`Block ${TOGGLE_BLOCK} txs to proxy:`, txsToProxyToggle.length);
+  for (const tx of txsToProxyToggle) {
+    console.log(
+      "tx:", tx.hash,
+      "from:", tx.from,
+      "to:", tx.to,
+      "input_prefix:", tx.data ? tx.data.slice(0, 10) : "0x",
+      "block:", tx.blockNumber
+    );
+    // Decode lostAndFound if selector matches
+    if (tx.data && tx.data.startsWith(INIT_V21_SELECTOR)) {
+      try {
+        const decoded = iface.decodeFunctionData("initializeV2_1", tx.data);
+        console.log("decoded lostAndFound:", decoded.lostAndFound || decoded[0]);
+      } catch (e) {
+        console.log("decode error:", e.message || e);
+      }
+      // Fetch receipt and decode logs
+      try {
+        const rcpt = await provider.getTransactionReceipt(tx.hash);
+        console.log("receipt (raw):", JSON.stringify(rcpt));
+        console.log("receipt status:", rcpt.status, "logs:", rcpt.logs.length);
+        for (const l of rcpt.logs) {
+          let parsed;
+          try {
+            parsed = iface.parseLog(l);
+          } catch (_) {}
+          console.log({
+            logAddress: l.address,
+            blockNumber: l.blockNumber,
+            txHash: l.transactionHash,
+            topics: l.topics,
+            parsed: parsed ? { name: parsed.name, args: parsed.args } : null,
+          });
+        }
+      } catch (e) {
+        console.log("receipt fetch error:", e.message || e);
+      }
+      // Attempt trace_transaction if supported
+      try {
+        const trace = await provider.send("trace_transaction", [tx.hash]);
+        console.log("trace_transaction length:", Array.isArray(trace) ? trace.length : typeof trace);
+      } catch (e) {
+        console.log("trace_transaction not available:", e.message || e);
+      }
+    }
+  }
+
+  // 2) Block FIRST_CODE_BLOCK with transactions -> any tx to proxy?
+  const blkFirst = await provider.getBlockWithTransactions(FIRST_CODE_BLOCK);
+  const txsToProxyFirst = blkFirst.transactions.filter(
+    (tx) => tx.to && tx.to.toLowerCase() === PROXY
+  );
+  console.log(`Block ${FIRST_CODE_BLOCK} txs to proxy:`, txsToProxyFirst.length);
+  for (const tx of txsToProxyFirst) {
+    console.log(
+      "tx:", tx.hash,
+      "from:", tx.from,
+      "to:", tx.to,
+      "input_prefix:", tx.data ? tx.data.slice(0, 10) : "0x",
+      "block:", tx.blockNumber
+    );
+  }
+
+  // 3) Logs for proxy in small window around toggle
+  const logs = await provider.getLogs({
+    address: PROXY,
+    fromBlock: LOG_FROM,
+    toBlock: LOG_TO,
+  });
+  console.log(`Logs for proxy in [${LOG_FROM}, ${LOG_TO}]: count=${logs.length}`);
+  for (const l of logs.slice(0, 10)) {
+    let parsed;
+    try { parsed = iface.parseLog(l); } catch (_) {}
+    console.log({
+      blockNumber: l.blockNumber,
+      txHash: l.transactionHash,
+      topics: l.topics,
+      parsed: parsed ? { name: parsed.name, args: parsed.args } : null,
+    });
+  }
+
+  // 3b) Wider window scan around toggle in chunks
+  const delta = 2000;
+  const fromW = TOGGLE_BLOCK - delta;
+  const toW = TOGGLE_BLOCK + delta;
+  const chunk = 500;
+  let total = 0;
+  const rawWiderLogs = [];
+  console.log(`Scanning wider logs window [${fromW}, ${toW}] in chunks of ${chunk}...`);
+  for (let b = fromW; b <= toW; b += chunk) {
+    const t = Math.min(toW, b + chunk - 1);
+    try {
+      const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t });
+      total += ls.length;
+      rawWiderLogs.push(...ls);
+      // print any logs parsed as Blacklisted/Transfer
+      for (const l of ls) {
+        let parsed;
+        try { parsed = iface.parseLog(l); } catch (_) {}
+        if (parsed && (parsed.name === "Blacklisted" || parsed.name === "Transfer")) {
+          console.log("log:", { blk: l.blockNumber, tx: l.transactionHash, event: parsed.name, args: parsed.args });
+        }
+      }
+    } catch (e) {
+      console.log(`  getLogs error [${b}, ${t}]:`, e.message || e);
+    }
+  }
+  console.log("wider window total logs:", total);
+  if (rawWiderLogs.length > 0) {
+    console.log("First couple of raw logs:", rawWiderLogs.slice(0, 2));
+  }
+
+  // 4) Transfer reconstruction before toggle: [FIRST_CODE_BLOCK, TOGGLE_BLOCK]
+  const { incoming, outgoing, sumIn, sumOut } = await scanTransfersInRange(FIRST_CODE_BLOCK, TOGGLE_BLOCK);
+  console.log(`Transfers to proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, incoming.length, "sumIn:", sumIn.toString());
+  console.log(`Transfers from proxy in [${FIRST_CODE_BLOCK}, ${TOGGLE_BLOCK}]:`, outgoing.length, "sumOut:", sumOut.toString());
+
+  // 5) Upgraded events across full history since firstCodeBlock
+  const latest = await provider.getBlockNumber();
+  const UPGR_TOPIC = ethers.utils.id("Upgraded(address)");
+  let upgrades = [];
+  console.log(`Scanning Upgraded events from ${FIRST_CODE_BLOCK} to ${latest} in 50000-block chunks...`);
+  for (let b = FIRST_CODE_BLOCK; b <= latest; b += 50000) {
+    const t = Math.min(latest, b + 50000 - 1);
+    try {
+      const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t, topics: [UPGR_TOPIC] });
+      upgrades.push(...ls);
+    } catch (e) {
+      console.log(`  Upgraded scan error [${b}, ${t}]:`, e.message || e);
+    }
+  }
+  console.log("Upgraded events count:", upgrades.length);
+  if (upgrades.length > 0) {
+    for (const l of upgrades) {
+      console.log({ blk: l.blockNumber, tx: l.transactionHash, topic0: l.topics[0], data: l.data, topics: l.topics });
+    }
+  }
+
+  // 6) Full-range Blacklisted events since first code block
+  const BLACKLISTED_TOPIC = ethers.utils.id("Blacklisted(address)");
+  let blCount = 0;
+  let blSamples = [];
+  console.log(`Scanning Blacklisted events from ${FIRST_CODE_BLOCK} to ${latest} in 50000-block chunks...`);
+  for (let b = FIRST_CODE_BLOCK; b <= latest; b += 50000) {
+    const t = Math.min(latest, b + 50000 - 1);
+    try {
+      const ls = await provider.getLogs({ address: PROXY, fromBlock: b, toBlock: t, topics: [BLACKLISTED_TOPIC] });
+      blCount += ls.length;
+      if (blSamples.length < 5) blSamples.push(...ls.slice(0, 5 - blSamples.length));
+    } catch (e) {
+      console.log(`  Blacklisted scan error [${b}, ${t}]:`, e.message || e);
+    }
+  }
+  console.log("Blacklisted events count:", blCount);
+  if (blSamples.length > 0) {
+    console.log("Blacklisted sample logs:", blSamples.map(l => ({ blk: l.blockNumber, tx: l.transactionHash, topics: l.topics })));
+  }
+
+  // 7) Check implementation bytecode contains selector
+  const code = await provider.getCode(IMPLEMENTATION, "latest");
+  const hasSelector = code.toLowerCase().includes(INIT_V21_SELECTOR.slice(2));
+  console.log("implementation selector 0x2fc81e09 present:", hasSelector);
+
+  console.log("done");
+})().catch((e) => {
+  console.error("fatal:", e);
+  process.exit(1);
+});
