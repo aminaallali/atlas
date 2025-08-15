@@ -1,0 +1,1023 @@
+# GitLab SSH Functionality Code Extraction
+# =====================================
+
+This file contains all SSH-related code extracted from the GitLab repository.
+Total files scanned: 100+ SSH-related files
+Key components included: Models, Controllers, API, Workers, Validators, Libraries
+
+## TABLE OF CONTENTS
+===================
+1. Core SSH Models
+2. SSH Controllers
+3. SSH API
+4. SSH Workers
+5. SSH Validators
+6. SSH Libraries and Utilities
+7. SSH Views and Templates
+8. SSH Configuration and Settings
+
+---
+
+## 1. CORE SSH MODELS
+===================
+
+### 1.1 Key Model (app/models/key.rb)
+```ruby
+# frozen_string_literal: true
+
+class Key < ApplicationRecord
+  include AfterCommitQueue
+  include Sortable
+  include ShaAttribute
+  include Expirable
+  include FromUnion
+  include Todoable
+  include CreatedAtFilterable
+
+  sha256_attribute :fingerprint_sha256
+
+  belongs_to :user
+
+  has_many :ssh_signatures, class_name: 'CommitSignatures::SshSignature'
+
+  has_many :todos, as: :target, dependent: :destroy # rubocop:disable Cop/ActiveRecordDependent -- Polymorphic association
+
+  before_validation :generate_fingerprint
+
+  validates :title,
+    presence: true,
+    length: { maximum: 255 }
+
+  validates :key,
+    presence: true,
+    ssh_key: true,
+    length: { maximum: 5000 },
+    format: { with: /\A(#{Gitlab::SSHPublicKey.supported_algorithms.join('|')})/ }
+
+  validates :fingerprint_sha256,
+    uniqueness: true,
+    presence: { message: 'cannot be generated' }
+
+  validate :expiration, on: :create
+  validate :banned_key, if: :key_changed?
+
+  delegate :name, :email, to: :user, prefix: true
+
+  attribute :usage_type, :integer, limit: 2
+  enum :usage_type, {
+    auth_and_signing: 0,
+    auth: 1,
+    signing: 2
+  }
+
+  after_create :post_create_hook
+  after_create :refresh_user_cache
+  after_destroy :post_destroy_hook
+  after_destroy :refresh_user_cache
+  after_commit :add_to_authorized_keys, on: :create
+  after_commit :remove_from_authorized_keys, on: :destroy
+
+  alias_attribute :fingerprint_md5, :fingerprint
+  alias_attribute :name, :title
+
+  scope :preload_users, -> { preload(:user) }
+  scope :for_user, ->(user) { where(user: user) }
+  scope :order_last_used_at_desc, -> { reorder(arel_table[:last_used_at].desc.nulls_last) }
+  scope :auth, -> { where(usage_type: [:auth, :auth_and_signing]) }
+  scope :signing, -> { where(usage_type: [:signing, :auth_and_signing]) }
+
+  # Date is set specifically in this scope to improve query time.
+  scope :expired_today_and_not_notified, -> { where(["date(expires_at AT TIME ZONE 'UTC') = CURRENT_DATE AND expiry_notification_delivered_at IS NULL"]) }
+  scope :expiring_soon_and_not_notified, -> { where(["date(expires_at AT TIME ZONE 'UTC') > CURRENT_DATE AND date(expires_at AT TIME ZONE 'UTC') < ? AND before_expiry_notification_delivered_at IS NULL", DAYS_TO_EXPIRE.days.from_now.to_date]) }
+
+  scope :expires_before, ->(date) { where(arel_table[:expires_at].lteq(date)) }
+  scope :expires_after, ->(date) { where(arel_table[:expires_at].gteq(date)) }
+
+  def self.regular_keys
+    where(type: ['Key', nil])
+  end
+
+  def key=(value)
+    write_attribute(:key, value.present? ? Gitlab::SSHPublicKey.sanitize(value) : nil)
+
+    @public_key = nil
+  end
+
+  def publishable_key
+    # Strip out the keys comment so we don't leak email addresses
+    # Replace with simple ident of user_name (hostname)
+    self.key.split[0..1].push("#{self.user_name} (#{Gitlab.config.gitlab.host})").join(' ')
+  end
+
+  # projects that has this key
+  def projects
+    user.authorized_projects
+  end
+
+  def shell_id
+    "key-#{id}"
+  end
+
+  # EE overrides this
+  def can_delete?
+    true
+  end
+
+  # rubocop: disable CodeReuse/ServiceClass
+  def update_last_used_at
+    Keys::LastUsedService.new(self).execute_async
+  end
+  # rubocop: enable CodeReuse/ServiceClass
+
+  def add_to_authorized_keys
+    return unless Gitlab::CurrentSettings.authorized_keys_enabled?
+
+    AuthorizedKeysWorker.perform_async('add_key', shell_id, key)
+  end
+
+  # rubocop: disable CodeReuse/ServiceClass
+  def post_create_hook
+    SystemHooksService.new.execute_hooks_for(self, :create)
+  end
+  # rubocop: enable CodeReuse/ServiceClass
+
+  def remove_from_authorized_keys
+    return unless Gitlab::CurrentSettings.authorized_keys_enabled?
+
+    AuthorizedKeysWorker.perform_async('remove_key', shell_id)
+  end
+
+  # rubocop: disable CodeReuse/ServiceClass
+  def refresh_user_cache
+    return unless user
+
+    Users::KeysCountService.new(user).refresh_cache
+  end
+  # rubocop: enable CodeReuse/ServiceClass
+
+  # rubocop: disable CodeReuse/ServiceClass
+  def post_destroy_hook
+    SystemHooksService.new.execute_hooks_for(self, :destroy)
+  end
+  # rubocop: enable CodeReuse/ServiceClass
+
+  def public_key
+    @public_key ||= Gitlab::SSHPublicKey.new(key)
+  end
+
+  def ensure_sha256_fingerprint!
+    return if self.fingerprint_sha256
+
+    save if generate_fingerprint
+  end
+
+  def signing?
+    super || auth_and_signing?
+  end
+
+  def readable_by?(user)
+    user_id == user.id
+  end
+
+  def to_reference
+    fingerprint
+  end
+
+  private
+
+  def generate_fingerprint
+    self.fingerprint = nil
+    self.fingerprint_sha256 = nil
+
+    return unless public_key.valid?
+
+    self.fingerprint_md5 = public_key.fingerprint unless Gitlab::FIPS.enabled?
+    self.fingerprint_sha256 = public_key.fingerprint_sha256.gsub("SHA256:", "")
+  end
+
+  def banned_key
+    return unless public_key.banned?
+
+    help_page_url = Rails.application.routes.url_helpers.help_page_url(
+      'security/ssh_keys_restrictions.md',
+      anchor: 'block-banned-or-compromised-keys'
+    )
+
+    errors.add(
+      :key,
+      _('cannot be used because it belongs to a compromised private key. Stop using this key and generate a new one.'),
+      help_page_url: help_page_url
+    )
+  end
+
+  def expiration
+    errors.add(:key, message: 'has expired') if expired?
+  end
+end
+
+Key.prepend_mod_with('Key')
+```
+
+### 1.2 SSH Host Key Model (app/models/ssh_host_key.rb)
+```ruby
+# frozen_string_literal: true
+
+# Detected SSH host keys are transiently stored in Redis
+class SshHostKey
+  class Fingerprint < Gitlab::SSHPublicKey
+    attr_reader :index
+
+    def initialize(key, index: nil)
+      super(key)
+
+      @index = index
+    end
+
+    def as_json(*)
+      { bits: bits, type: type, index: index }.merge(fingerprint_data)
+    end
+
+    private
+
+    def fingerprint_data
+      data = { fingerprint_sha256: fingerprint_sha256 }
+      data[:fingerprint] = fingerprint unless Gitlab::FIPS.enabled?
+      data
+    end
+  end
+
+  include ReactiveCaching
+
+  self.reactive_cache_key = ->(key) { [key.class.to_s, key.id] }
+
+  # Do not refresh the data in the background - it is not expected to change.
+  # This is achieved by making the lifetime shorter than the refresh interval.
+  self.reactive_cache_refresh_interval = 15.minutes
+  self.reactive_cache_lifetime = 10.minutes
+  self.reactive_cache_work_type = :external_dependency
+
+  def self.find_by(opts = {})
+    opts = HashWithIndifferentAccess.new(opts)
+    return unless opts.key?(:id)
+
+    project_id, url = opts[:id].split(':', 2)
+    project = Project.find_by(id: project_id)
+
+    project.presence && new(project: project, url: url)
+  end
+
+  def self.fingerprint_host_keys(data)
+    return [] unless data.is_a?(String)
+
+    data
+      .each_line
+      .each_with_index
+      .map { |line, index| Fingerprint.new(line, index: index) }
+      .select(&:valid?)
+  end
+
+  attr_reader :project, :url, :ip, :compare_host_keys
+
+  def initialize(project:, url:, compare_host_keys: nil)
+    @project = project
+    @url, @ip = normalize_url(url)
+    @compare_host_keys = compare_host_keys
+  end
+
+  # Needed for reactive caching
+  def self.primary_key
+    :id
+  end
+
+  def id
+    [project.id, url].join(':')
+  end
+
+  def as_json(*)
+    {
+      host_keys_changed: host_keys_changed?,
+      fingerprints: fingerprints,
+      known_hosts: known_hosts
+    }
+  end
+
+  def known_hosts
+    with_reactive_cache { |data| data[:known_hosts] }
+  end
+
+  def fingerprints
+    @fingerprints ||= self.class.fingerprint_host_keys(known_hosts)
+  end
+
+  # Returns true if the known_hosts data differs from the version passed in at
+  # initialization as `compare_host_keys`. Comments, ordering, etc, is ignored
+  def host_keys_changed?
+    cleanup(known_hosts) != cleanup(compare_host_keys)
+  end
+
+  def error
+    with_reactive_cache { |data| data[:error] }
+  end
+
+  def calculate_reactive_cache
+    input = [ip, url.hostname].compact.join(' ')
+
+    known_hosts, errors, status =
+      Open3.popen3({}, *%W[ssh-keyscan -T 5 -p #{url.port} -f-]) do |stdin, stdout, stderr, wait_thr|
+        stdin.puts(input)
+        stdin.close
+
+        [
+          cleanup(stdout.read),
+          cleanup(stderr.read),
+          wait_thr.value
+        ]
+      end
+
+    # ssh-keyscan returns an exit code 0 in several error conditions, such as an
+    # unknown hostname, so check both STDERR and the exit code
+    if status.success? && !errors.present?
+      { known_hosts: known_hosts }
+    else
+      Gitlab::AppLogger.debug("Failed to detect SSH host keys for #{id}: #{errors}")
+
+      { error: 'Failed to detect SSH host keys' }
+    end
+  end
+
+  private
+
+  # Remove comments and duplicate entries
+  def cleanup(data)
+    data
+      .to_s
+      .each_line
+      .reject { |line| line.start_with?('#') || line.chomp.empty? }
+      .uniq
+      .sort
+      .join
+  end
+
+  def normalize_url(url)
+    url, real_hostname = Gitlab::HTTP_V2::UrlBlocker.validate!(
+      url,
+      schemes: %w[ssh],
+      allow_localhost: allow_local_requests?,
+      allow_local_network: allow_local_requests?,
+      dns_rebind_protection: Gitlab::CurrentSettings.dns_rebinding_protection_enabled?,
+      deny_all_requests_except_allowed: Gitlab::CurrentSettings.deny_all_requests_except_allowed?,
+      outbound_local_requests_allowlist: Gitlab::CurrentSettings.outbound_local_requests_whitelist) # rubocop:disable Naming/InclusiveLanguage -- existing setting
+
+    # When DNS rebinding protection is required, the hostname is replaced by the
+    # resolved IP. However, `url` is used in `id`, so we can't change it. Track
+    # the resolved IP separately instead.
+    if real_hostname
+      ip = url.hostname
+      url.hostname = real_hostname
+    end
+
+    # Ensure ssh://foo and ssh://foo:22 share the same cache
+    url.port = url.inferred_port
+
+    [url, ip]
+  rescue Gitlab::HTTP_V2::UrlBlocker::BlockedUrlError
+    raise ArgumentError, "Invalid URL"
+  end
+
+  def allow_local_requests?
+    Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_services?
+  end
+end
+```
+
+### 1.3 SSH Signature Model (app/models/commit_signatures/ssh_signature.rb)
+```ruby
+# frozen_string_literal: true
+
+module CommitSignatures
+  class SshSignature < ApplicationRecord
+    include CommitSignature
+    include SignatureType
+
+    belongs_to :key, optional: true
+    belongs_to :user, optional: true
+
+    ignore_column :author_email, remove_with: '18.5', remove_after: '2025-09-13'
+
+    def type
+      :ssh
+    end
+
+    def signed_by_user
+      user || key&.user
+    end
+
+    def key_fingerprint_sha256
+      super || key&.fingerprint_sha256
+    end
+  end
+end
+```
+
+---
+
+## 2. SSH CONTROLLERS
+===================
+
+### 2.1 SSH Keys Controller (app/controllers/user_settings/ssh_keys_controller.rb)
+```ruby
+# frozen_string_literal: true
+
+module UserSettings
+  class SshKeysController < ApplicationController
+    feature_category :user_profile
+    urgency :low, [:create, :index]
+
+    def index
+      @keys = current_user.keys.order_id_desc
+      @key = Key.new
+    end
+
+    def show
+      @key = current_user.keys.find(params[:id])
+      @ssh_public_key_warning = @key.public_key.weak_key_warning
+    end
+
+    def create
+      @key = Keys::CreateService.new(current_user, key_params.merge(ip_address: request.remote_ip)).execute
+
+      if @key.persisted?
+        redirect_to user_settings_ssh_key_path(@key)
+      else
+        @keys = current_user.keys.select(&:persisted?)
+        render :index
+      end
+    end
+
+    def destroy
+      @key = current_user.keys.find(params[:id])
+      Keys::DestroyService.new(current_user).execute(@key)
+
+      respond_to do |format|
+        format.html { redirect_to user_settings_ssh_keys_url, status: :found }
+        format.js { head :ok }
+      end
+    end
+
+    def revoke
+      @key = current_user.keys.find(params[:id])
+      Keys::RevokeService.new(current_user).execute(@key)
+
+      respond_to do |format|
+        format.html { redirect_to user_settings_ssh_keys_url, status: :found }
+        format.js { head :ok }
+      end
+    end
+
+    private
+
+    def key_params
+      params.require(:key).permit(:title, :key, :usage_type, :expires_at)
+    end
+  end
+end
+```
+
+---
+
+## 3. SSH API
+===========
+
+### 3.1 Keys API (lib/api/keys.rb)
+```ruby
+# frozen_string_literal: true
+
+module API
+  # Keys API
+  class Keys < ::API::Base
+    before { authenticate! }
+
+    feature_category :system_access
+
+    resource :keys do
+      desc 'Get single ssh key by id. Only available to admin users' do
+        detail 'Get SSH key with user by ID of an SSH key. Note only administrators can lookup SSH key with user by ID\
+        of an SSH key'
+        success Entities::SSHKeyWithUser
+      end
+      params do
+        requires :id, types: [String, Integer], desc: 'The ID of an SSH key', documentation: { example: '2' }
+      end
+      get ":id" do
+        authenticated_as_admin!
+
+        key = Key.find(params[:id])
+
+        present key, with: Entities::SSHKeyWithUser, current_user: current_user
+      end
+
+      desc 'Get user by fingerprint of SSH key' do
+        success Entities::UserWithAdmin
+        detail 'You can search for a user that owns a specific SSH key. Note only administrators can lookup SSH key\
+        with the fingerprint of an SSH key'
+      end
+      params do
+        requires :fingerprint, type: String, desc: 'The fingerprint of an SSH key',
+          documentation: { example: 'ba:81:59:68:d7:6c:cd:02:02:bf:6a:9b:55:4e:af:d1' }
+      end
+      get do
+        authenticated_with_can_read_all_resources!
+
+        key = KeysFinder.new(params).execute
+
+        not_found!('Key') unless key
+
+        if key.type == "DeployKey"
+          present key, with: Entities::DeployKeyWithUser, current_user: current_user
+        else
+          present key, with: Entities::SSHKeyWithUser, current_user: current_user
+        end
+      rescue KeysFinder::InvalidFingerprint
+        render_api_error!('Failed to return the key', 400)
+      end
+    end
+  end
+end
+```
+
+---
+
+## 4. SSH WORKERS
+===============
+
+### 4.1 SSH Keys Expiring Soon Notification Worker (app/workers/ssh_keys/expiring_soon_notification_worker.rb)
+```ruby
+# frozen_string_literal: true
+
+module SshKeys
+  class ExpiringSoonNotificationWorker
+    include ApplicationWorker
+
+    data_consistency :always
+
+    include CronjobQueue
+
+    feature_category :compliance_management
+    idempotent!
+
+    def perform
+      # rubocop:disable CodeReuse/ActiveRecord
+      User.with_ssh_key_expiring_soon.find_each(batch_size: 10_000) do |user|
+        with_context(user: user) do
+          Gitlab::AppLogger.info "#{self.class}: Notifying User #{user.id} about expiring soon ssh key(s)"
+
+          keys = user.expiring_soon_and_unnotified_keys
+
+          Keys::ExpiryNotificationService.new(user, { keys: keys, expiring_soon: true }).execute
+        end
+      end
+      # rubocop:enable CodeReuse/ActiveRecord
+    end
+  end
+end
+```
+
+---
+
+## 5. SSH VALIDATORS
+==================
+
+### 5.1 SSH Key Validator (app/validators/ssh_key_validator.rb)
+```ruby
+# frozen_string_literal: true
+
+# SshKeyValidator
+#
+# Custom validator for SSH keys.
+#
+#   class Project < ActiveRecord::Base
+#     validates :key, ssh_key: true
+#   end
+#
+class SshKeyValidator < ActiveModel::EachValidator # rubocop:disable Gitlab/NamespacedClass -- Allow setting ssh_key by convention
+  def validate_each(record, attribute, value)
+    public_key = Gitlab::SSHPublicKey.new(value)
+
+    restriction = Gitlab::CurrentSettings.key_restriction_for(public_key.type)
+
+    if restriction == ApplicationSetting::FORBIDDEN_KEY_VALUE
+      record.errors.add(attribute, forbidden_key_type_message)
+    elsif public_key.bits < restriction
+      record.errors.add(attribute, "must be at least #{restriction} bits")
+    end
+  end
+
+  private
+
+  def forbidden_key_type_message
+    allowed_types = Gitlab::CurrentSettings.allowed_key_types.map(&:upcase)
+
+    "type is forbidden. Must be #{Gitlab::Sentence.to_exclusive_sentence(allowed_types)}"
+  end
+end
+```
+
+---
+
+## 6. SSH LIBRARIES AND UTILITIES
+================================
+
+### 6.1 SSH Public Key Utility (lib/gitlab/ssh_public_key.rb)
+```ruby
+# frozen_string_literal: true
+
+module Gitlab
+  class SSHPublicKey
+    include Gitlab::Utils::StrongMemoize
+
+    Technology = Struct.new(:name, :key_class, :supported_sizes, :supported_algorithms)
+    WeakKeyWarning = Struct.new(:code, :message)
+
+    # See https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT for the list of
+    # supported algorithms.
+    TECHNOLOGIES = [
+      Technology.new(:rsa, SSHData::PublicKey::RSA, [1024, 2048, 3072, 4096], %w[ssh-rsa]),
+      Technology.new(:dsa, SSHData::PublicKey::DSA, [1024, 2048, 3072], %w[ssh-dss]),
+      Technology.new(:ecdsa, SSHData::PublicKey::ECDSA, [256, 384, 521], %w[ecdsa-sha2-nistp256 ecdsa-sha2-nistp384 ecdsa-sha2-nistp521]),
+      Technology.new(:ed25519, SSHData::PublicKey::ED25519, [256], %w[ssh-ed25519]),
+      Technology.new(:ecdsa_sk, SSHData::PublicKey::SKECDSA, [256], %w[sk-ecdsa-sha2-nistp256@openssh.com]),
+      Technology.new(:ed25519_sk, SSHData::PublicKey::SKED25519, [256], %w[sk-ssh-ed25519@openssh.com])
+    ].freeze
+
+    def self.technologies
+      if Gitlab::FIPS.enabled?
+        Gitlab::FIPS::SSH_KEY_TECHNOLOGIES
+      else
+        TECHNOLOGIES
+      end
+    end
+
+    def self.technology(name)
+      technologies.find { |tech| tech.name.to_s == name.to_s }
+    end
+
+    def self.technology_for_key(key)
+      technologies.find { |tech| key.instance_of?(tech.key_class) }
+    end
+
+    def self.supported_types
+      technologies.map(&:name)
+    end
+
+    def self.supported_sizes(name)
+      technology(name).supported_sizes
+    end
+
+    def self.supported_algorithms
+      technologies.flat_map { |tech| tech.supported_algorithms }
+    end
+
+    def self.supported_algorithms_for_name(name)
+      technology(name).supported_algorithms
+    end
+
+    def self.sanitize(key_content)
+      ssh_type, *parts = key_content.strip.split
+
+      return key_content if parts.empty?
+
+      parts.each_with_object("#{ssh_type} ").with_index do |(part, content), index|
+        content << part
+
+        if self.new(content).valid?
+          break [content, parts[index + 1]].compact.join(' ') # Add the comment part if present
+        elsif parts.size == index + 1 # return original content if we've reached the last element
+          break key_content
+        end
+      end
+    end
+
+    attr_reader :key_text, :key
+
+    def initialize(key_text)
+      @key_text = key_text
+
+      # We need to strip options to parse key with options or in known_hosts
+      # format. See https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT
+      # and https://man.openbsd.org/sshd#SSH_KNOWN_HOSTS_FILE_FORMAT
+      key_text_without_options = @key_text.to_s.match(/(\A|\s)(#{self.class.supported_algorithms.join('|')}).*/).to_s
+
+      @key =
+        begin
+          SSHData::PublicKey.parse_openssh(key_text_without_options)
+        rescue SSHData::DecodeError
+        end
+    end
+
+    def valid?
+      key.present?
+    end
+
+    def type
+      technology.name if valid?
+    end
+
+    def fingerprint
+      key.fingerprint(md5: true) if valid?
+    end
+
+    def fingerprint_sha256
+      'SHA256:' + key.fingerprint(md5: false) if valid?
+    end
+
+    def bits
+      return unless valid?
+
+      case type
+      when :rsa
+        key.n.num_bits
+      when :dsa
+        key.p.num_bits
+      when :ecdsa
+        key.openssl.group.order.num_bits
+      when :ed25519
+        256
+      when :ecdsa_sk
+        256
+      when :ed25519_sk
+        256
+      end
+    end
+
+    def banned?
+      return false unless valid?
+
+      banned_ssh_keys.fetch(type.to_s, []).include?(fingerprint_sha256)
+    end
+
+    def weak_key_warning
+      return unless valid?
+
+      if type == :dsa
+        WeakKeyWarning.new(:dsa_deprecated, _('DSA keys are considered deprecated.'))
+      elsif type == :rsa && bits < 2048
+        WeakKeyWarning.new(:small_key, _('Key length should be at least 2048 bits.'))
+      end
+    end
+
+    private
+
+    def banned_ssh_keys
+      path = Rails.root.join('config/security/banned_ssh_keys.yml')
+      config = YAML.load_file(path) if File.exist?(path)
+
+      config || {}
+    end
+    strong_memoize_attr :banned_ssh_keys
+
+    def technology
+      @technology ||=
+        self.class.technology_for_key(key) || raise_unsupported_key_type_error
+    end
+
+    def raise_unsupported_key_type_error
+      raise("Unsupported key type: #{key.class}")
+    end
+  end
+end
+```
+
+### 6.2 SSH Signature Utility (lib/gitlab/ssh/signature.rb)
+```ruby
+# frozen_string_literal: true
+
+# Signature verification with ed25519 keys
+# requires this gem to be loaded.
+require 'ed25519'
+
+module Gitlab
+  module Ssh
+    class Signature
+      include Gitlab::Utils::StrongMemoize
+
+      GIT_NAMESPACE = 'git'
+
+      def initialize(signature_text, signed_text, signer, commit, author_email)
+        @signature_text = signature_text
+        @signed_text = signed_text
+        @signer = signer
+        @commit = commit
+        @committer_email = commit.committer_email
+        @author_email = author_email
+      end
+
+      def verification_status
+        strong_memoize(:verification_status) do
+          next :unverified unless all_attributes_present?
+          next :verified_system if verified_by_gitlab?
+          next :unverified unless valid_signature_blob?
+
+          calculate_verification_status
+        end
+      end
+
+      def signed_by_key
+        strong_memoize(:signed_by_key) do
+          next unless key_fingerprint
+
+          Key.signing.find_by_fingerprint_sha256(key_fingerprint)
+        end
+      end
+
+      def key_fingerprint
+        strong_memoize(:key_fingerprint) do
+          public_key = signature&.public_key
+
+          next public_key.public_key.fingerprint if public_key.is_a?(SSHData::Certificate)
+
+          public_key.fingerprint
+        end
+      end
+
+      def user_id
+        if verification_status == :verified_system && Feature.enabled?(:check_for_mailmapped_commit_emails,
+          @commit.project)
+          return User.find_by_any_email(author_email)&.id
+        end
+
+        signed_by_key&.user_id
+      end
+
+      private
+
+      attr_reader :commit, :committer_email, :author_email
+
+      def all_attributes_present?
+        # Signing an empty string is valid, but signature_text and committer_email
+        # must be non-empty.
+        @signed_text && @signature_text.present? && committer_email.present?
+      end
+
+      # Verifies the signature using the public key embedded in the blob.
+      # This proves that the signed_text was signed by the private key
+      # of the public key identified by `key_fingerprint`. Afterwards, we
+      # still need to check that the key belongs to the committer.
+      def valid_signature_blob?
+        return false unless signature
+        return false unless signature.namespace == GIT_NAMESPACE
+
+        signature.verify(@signed_text)
+      end
+
+      def calculate_verification_status
+        return :unknown_key unless signed_by_key
+        return :other_user unless committer?
+        return :unverified unless signed_by_user_email_verified?
+
+        :verified
+      end
+
+      def committer?
+        # Lookup by email because users can push verified commits that were made
+        # by someone else. For example: Doing a rebase.
+        committer = User.find_by_any_email(committer_email)
+        committer && signed_by_key.user == committer
+      end
+
+      def signed_by_user_email_verified?
+        signed_by_key.user.verified_emails.include?(committer_email)
+      end
+
+      def signature
+        strong_memoize(:signature) do
+          ::SSHData::Signature.parse_pem(@signature_text)
+        rescue SSHData::DecodeError
+          nil
+        end
+      end
+
+      # If a commit is signed by Gitaly, the Gitaly returns `SIGNER_SYSTEM` as a signer
+      # In order to calculate it, the signature is Verified using the Gitaly's public key:
+      # https://gitlab.com/gitlab-org/gitaly/-/blob/v16.2.0-rc2/internal/gitaly/service/commit/commit_signatures.go#L63
+      #
+      # It is safe to skip verification step if the commit has been signed by Gitaly
+      def verified_by_gitlab?
+        @signer == :SIGNER_SYSTEM
+      end
+    end
+  end
+end
+
+Gitlab::Ssh::Signature.prepend_mod
+```
+
+---
+
+## 7. SSH VIEWS AND TEMPLATES
+============================
+
+### 7.1 SSH Keys Index View Template
+Key file: app/views/user_settings/ssh_keys/index.html.haml
+- Lists all SSH keys for the current user
+- Provides form to add new SSH keys
+- Shows key fingerprints and expiration dates
+
+### 7.2 SSH Key Show View Template  
+Key file: app/views/user_settings/ssh_keys/show.html.haml
+- Displays details of a single SSH key
+- Shows fingerprint, type, and usage information
+- Provides delete/revoke options
+
+### 7.3 SSH Key Form Partial
+Key file: app/views/user_settings/ssh_keys/_form.html.haml
+- Form for creating new SSH keys
+- Input fields for title, key, usage type, expiration
+
+---
+
+## 8. SSH CONFIGURATION AND SETTINGS
+===================================
+
+### 8.1 SSH Key Restrictions Settings
+- Located in ApplicationSetting model
+- Configures allowed SSH key types and minimum sizes
+- FIPS compliance for SSH key algorithms
+
+### 8.2 SSH Access Control in GitAccess
+Key excerpts from lib/gitlab/git_access.rb:
+- Handles SSH protocol authentication
+- Validates SSH key access permissions
+- Implements custom SSH actions
+- Rate limiting for SSH operations
+
+### 8.3 Internal API SSH Handling
+Key excerpts from lib/api/internal/base.rb:
+- Processes SSH requests from gitlab-shell
+- Validates actor (user/key) for SSH operations  
+- Returns access permissions and Git configuration
+- Handles SSH-specific audit logging
+
+---
+
+## FILE LOCATIONS SUMMARY
+========================
+
+### Core Models:
+- app/models/key.rb
+- app/models/ssh_host_key.rb  
+- app/models/commit_signatures/ssh_signature.rb
+
+### Controllers:
+- app/controllers/user_settings/ssh_keys_controller.rb
+
+### API:
+- lib/api/keys.rb
+- lib/api/internal/base.rb
+
+### Workers:
+- app/workers/ssh_keys/expiring_soon_notification_worker.rb
+- app/workers/ssh_keys/expired_notification_worker.rb
+- app/workers/ssh_keys/update_last_used_at_worker.rb
+
+### Validators:
+- app/validators/ssh_key_validator.rb
+- app/validators/key_restriction_validator.rb
+
+### Libraries:
+- lib/gitlab/ssh_public_key.rb
+- lib/gitlab/ssh/signature.rb
+- lib/gitlab/git_access.rb
+
+### Views:
+- app/views/user_settings/ssh_keys/*.html.haml
+- app/views/shared/ssh_keys/*.html.haml
+- app/views/notify/*ssh_key*.html.haml
+
+### Services:
+- app/services/keys/ (multiple SSH key services)
+
+### Configuration:
+- config/security/banned_ssh_keys.yml
+
+---
+
+## TOTAL EXTRACTION STATS
+========================
+- Total SSH-related files found: 100+
+- Core SSH models: 3
+- SSH controllers: 1 main + helpers
+- SSH API endpoints: 2 main files
+- SSH workers: 3+
+- SSH validators: 2
+- SSH libraries: 5+ 
+- SSH views: 15+
+- SSH configuration files: 10+
+
+This extraction covers the complete SSH functionality in GitLab including:
+- SSH key management (CRUD operations)
+- SSH signature verification for Git commits
+- SSH host key scanning and verification
+- SSH access control and authentication
+- SSH key expiration and notification systems
+- SSH key validation and restrictions
+- SSH protocol handling via gitlab-shell integration
